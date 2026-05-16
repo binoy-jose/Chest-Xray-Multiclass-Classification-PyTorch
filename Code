@@ -1,0 +1,394 @@
+# Chest X-ray Classification using Deep Learning
+
+---
+
+## 1. Import Libraries
+
+```python
+import numpy as np
+import pandas as pd
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms, models
+from PIL import Image
+from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import f1_score
+from tqdm import tqdm
+```
+
+---
+
+## 2. Load Dataset
+
+```python
+train_df = pd.read_csv('/kaggle/input/competitions/26-t-1-dl-gen-ainppe-1/train.csv')
+
+# Extract class columns
+class_names = train_df.columns[1:]
+
+# Convert one-hot labels to single class index
+train_df['label'] = np.argmax(train_df[class_names].values, axis=1)
+```
+
+---
+## 3. Exploratory Data Analysis (EDA)
+```python
+# Plotting the data for class distribution
+train_df['label'].value_counts().sort_index().plot(kind='bar')
+plt.title("Class Distribution")
+plt.xlabel("Class Index")
+plt.ylabel("Count")
+plt.show()
+
+
+# To see some xrays of each class
+
+def show_one_per_class(df, img_dir, class_names):
+    
+    plt.figure(figsize=(15, 10))
+    
+    for i, class_idx in enumerate(sorted(df['label'].unique())):
+        
+        sample = df[df['label'] == class_idx].iloc[0]
+        
+        img_path = os.path.join(img_dir, sample['id'])
+        image = Image.open(img_path).convert('RGB')
+        
+        plt.subplot(4, 5, i+1)  
+        plt.imshow(image)
+        plt.title(f"Class {class_idx}")
+        plt.axis('off')
+    
+    plt.tight_layout()
+    plt.show()
+	
+show_one_per_class(
+    train_df,
+    '/kaggle/input/competitions/26-t-1-dl-gen-ainppe-1/images',
+    class_names
+)
+```
+---
+## 4. Compute Class Weights
+
+```python
+#Choosing which model to run
+MODEL_NAME = "resnet"                   # resnet34/densenet/resnet
+
+#Computing class weights
+class_weights = compute_class_weight(
+    class_weight='balanced',
+    classes=np.unique(train_df['label']),
+    y=train_df['label']
+)
+#Converting to tensor
+class_weights = torch.tensor(class_weights, dtype=torch.float)
+```
+---
+
+## 5. Custom Dataset Class
+
+```python
+# Custom PyTorch Dataset class to load images dynamically, apply transformations, and return image-label pairs
+
+# Create Custom Dataset Class
+class XrayDataset(Dataset):
+
+    # Initialization (runs once when dataset is created)
+    def __init__(self, df, img_dir, transform=None):
+        self.df = df                    # dataframe with image names + labels
+        self.img_dir = img_dir          # folder where images are stored
+        self.transform = transform      # transformations (resize, tensor, etc.)
+
+
+    # Length of dataset
+    def __len__(self):
+        return len(self.df)             # total number of images
+
+
+    # Get one data point
+    def __getitem__(self, idx):                                                      
+        img_name = self.df.iloc[idx]['id']               #  Get image name    
+        img_path = os.path.join(self.img_dir, img_name)  #  Create full image path       
+        image = Image.open(img_path).convert('RGB')      #  Open image        
+        
+        if 'label' in self.df.columns:
+            label = self.df.iloc[idx]['label']
+        else:
+            label = 0                                       # dummy label for test data
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, label  
+```
+
+---
+
+## 6. Data Transformations
+
+```python
+#Defining transform
+
+train_transform = transforms.Compose([
+    transforms.Resize((224, 224)),                        # Resize all images to 224x224 pixels
+    transforms.RandomHorizontalFlip(),                    # Randomly flip images horizontally to increase data diversity
+    transforms.RandomRotation(10),                        # Randomly rotate images within ±10 degrees to improve model robustness
+    transforms.ToTensor(),                                # Convert image into PyTorch tensor and scale pixel values to [0,1]
+    transforms.Normalize([0.485, 0.456, 0.406],           # Normalize using ImageNet mean and standard deviation
+                         [0.229, 0.224, 0.225])
+])
+
+val_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406],
+                         [0.229, 0.224, 0.225])
+])
+```
+
+---
+
+## 7. Train-Validation Split
+
+```python
+train_df_split, val_df = train_test_split(
+    train_df,
+    test_size=0.2,                # 20% for validation
+    stratify=train_df['label'],   # keeping class balance
+    random_state=42
+)
+```
+---
+
+## 8. Dataset objects and DataLoaders
+
+```python
+#Creating Dataset Objects
+train_dataset = XrayDataset(
+    df=train_df_split,             # Pass the training dataframe containing image IDs and labels
+    img_dir='/kaggle/input/competitions/26-t-1-dl-gen-ainppe-1/images',  # Specify the directory where training images are stored
+    transform=train_transform      # Apply training transformations (including augmentation) to images
+)
+
+val_dataset = XrayDataset(
+    df=val_df,
+    img_dir='/kaggle/input/competitions/26-t-1-dl-gen-ainppe-1/images',
+    transform=val_transform
+)
+
+#Data Loader
+
+train_loader = DataLoader(
+    train_dataset,              # Pass the training dataset object
+    batch_size=32,              # Number of samples processed in one iteration (mini-batch size)
+    shuffle=True                # Shuffle training data every epoch to improve model generalization
+)
+
+val_loader = DataLoader(
+    val_dataset,
+    batch_size=32,
+    shuffle=False               # Do not shuffle validation data to ensure consistent evaluation
+)
+```
+
+---
+
+## 9. Model (ResNet18/Resnet34/Densenet121)
+
+```python
+
+if MODEL_NAME == "resnet":
+    model = models.resnet18(pretrained=True)          # Load ResNet18 model with pretrained ImageNet weights
+    model.fc = nn.Linear(model.fc.in_features, 20)    # Replace the final fully connected layer to match 20 output classes
+elif MODEL_NAME == "resnet34":   
+    model = models.resnet34(pretrained=True)
+    model.fc = nn.Linear(model.fc.in_features, 20)
+elif MODEL_NAME == "densenet":
+    model = models.densenet121(pretrained=True)                # Load DenseNet121 model with pretrained ImageNet weights
+    model.classifier = nn.Linear(model.classifier.in_features, 20)  # Replace the classifier layer to match 20 output classes
+else:
+    raise ValueError("Invalid MODEL_NAME")  
+	
+]:
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")   # Select GPU if available, otherwise use CPU
+
+model = model.to(device)                                             # Move the model to the selected device for computation
+
+
+```
+
+---
+
+## 10. Optimizer and Loss Function
+
+```python
+#for update model weights during training    
+
+# Use Adam optimizer to update model weights with a learning rate of 0.00005
+optimizer = optim.Adam(model.parameters(), lr=5e-5)   
+
+#Loss Funtion
+# Defining CrossEntropy loss with class weights to handle class imbalance
+
+criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))     # Gives more importance to rare classes (handles imbalance)
+```
+
+---
+
+## 11. Training Loop
+
+```python
+#Training loop  
+
+def train_model(model, train_loader, val_loader, epochs=10):
+    
+    for epoch in range(epochs):
+        print(f"\nEpoch {epoch+1}/{epochs}")       # Print current epoch number
+        
+        # Training mode
+        model.train()
+        total_loss = 0                             # Initialize variable to track total training loss
+        
+        for images, labels in tqdm(train_loader):  # Loop through training data in batches with progress bar
+              
+            images = images.to(device)             # Move images to GPU/CPU
+            labels = labels.to(device)             # Move labels to GPU/CPU
+            
+            optimizer.zero_grad()                  # Reset gradients from previous iteration         
+            outputs = model(images)                # Forward pass : compute predictions         
+            loss = criterion(outputs, labels)      # Compute loss between predictions and true labels         
+            loss.backward()                        # Backpropagation: compute gradients
+            optimizer.step()                       # Update weights using optimizer
+            
+            total_loss += loss.item()              # Accumulate loss for this batch
+        
+        
+        # Print average training loss for the epoch
+        print(f"Training Loss: {total_loss / len(train_loader)}")   
+		
+
+#Initialize training
+train_model(model, train_loader, val_loader, epochs=10)
+
+
+```
+
+---
+
+## 12. Evaluation Metrics
+
+```python
+#Evaluation
+
+def evaluate_model(model, val_loader):
+    model.eval()                             # Set model to evaluation mode 
+    
+    y_true = []                              # List to store actual labels
+    y_pred = []                              # List to store predicted labels
+    
+    with torch.no_grad():                    # Disable gradient computation (saves memory and speeds up evaluation)
+        for images, labels in val_loader:    # Loop through validation data batch by batch
+            
+            images = images.to(device)       # Move images to GPU/CPU for computation
+            
+            outputs = model(images)          # Forward pass: get model predictions (logits)
+            
+            preds = torch.argmax(outputs, dim=1).cpu().numpy()     # Convert logits to predicted class labels (highest score)
+            
+            y_pred.extend(preds)             # Store predicted labels
+            y_true.extend(labels.numpy())    # Store actual labels
+    
+    # Defining Custom Score function
+    custom = 0
+    for t, p in zip(y_true, y_pred):
+        if t == p:
+            custom += 1                     # Add +1 for correct prediction
+        else:
+            custom -= 6                     # Subtract 6 for incorrect prediction (penalty)
+    
+    custom_score = custom / len(y_true)     # Compute average custom score
+    
+    # defining Weighted F1 Score
+    weighted_f1 = f1_score(y_true, y_pred, average='weighted')
+    
+    return custom_score, weighted_f1
+	
+#calling the evaluation function
+custom, f1 = evaluate_model(model, val_loader)
+
+print("Custom Score:", custom)
+print("Weighted F1 Score:", f1)
+```
+
+---
+
+## 13. Test Prediction
+
+```python
+
+#Loading test data
+test_df = pd.read_csv('/kaggle/input/competitions/26-t-1-dl-gen-ainppe-1/test.csv')
+
+#Creating test dataset
+test_dataset = XrayDataset(
+    df=test_df,                                                          # Pass test dataframe containing only image IDs (no labels)
+    img_dir='/kaggle/input/competitions/26-t-1-dl-gen-ainppe-1/images',  # Path to directory where test images are stored
+    transform=val_transform                                              # Apply validation transformations (no augmentation, only resize + normalization)
+)
+
+#Test data loader
+test_loader = DataLoader(
+    test_dataset,                                                        # Load test dataset
+    batch_size=32,                                                       # Process test data in batches of 32
+    shuffle=False                                                        # Do not shuffle to maintain correct order for submission
+)
+
+# Prediction
+# Set model to evaluation mode (disable dropout, use fixed batchnorm stats)
+
+model.eval()    
+
+predictions = []                                                         # Initialize list to store predicted probabilities
+
+with torch.no_grad():                                                    # Disable gradient computation for faster inference and lower memory usage
+    for images, _ in test_loader:                                        # Loop through test data (labels are ignored as test data is unlabeled)
+        
+        images = images.to(device)                                       # Move images to GPU/CPU
+        
+        outputs = model(images)                                          # Forward pass: get raw model outputs 
+        
+        preds = torch.argmax(outputs, dim=1).cpu().numpy()
+
+        # Convert to one-hot
+        batch_preds = np.zeros((len(preds), len(class_names)),dtype=int)
+
+        for i, p in enumerate(preds):
+            batch_preds[i, p] = 1
+
+        predictions.extend(batch_preds)
+```
+
+---
+
+## 14. Submission File
+
+```python
+
+#Loading the submission file
+sample_sub = pd.read_csv('/kaggle/input/competitions/26-t-1-dl-gen-ainppe-1/sample_submission.csv')
+
+class_names = sample_sub.columns[1:]
+#Creating submission file
+submission = pd.DataFrame(predictions, columns=class_names)
+submission.insert(0, 'id', test_df['id'])
+
+submission.to_csv('submission.csv', index=False)
+```
+
+---
